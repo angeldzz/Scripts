@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -544,6 +545,13 @@ func sortIPs(ips []string) {
 }
 
 func main() {
+	// --- FIX CRÍTICO PARA EL EMULADOR iSH ---
+	// Restringir el runtime a 1 solo hilo del Sistema Operativo evita por completo
+	// la corrupción de memoria y el error "runtime: split stack overflow".
+	// Las goroutines seguirán siendo concurrentes y ultrarrápidas sobre este único hilo.
+	runtime.GOMAXPROCS(1)
+	os.Setenv("GODEBUG", "asyncpreemptoff=1")
+
 	startTime := time.Now()
 	printBanner()
 
