@@ -182,25 +182,32 @@ func inc(ip net.IP) {
 
 func arpSweepDial(ips []string) {
 	fmt.Printf("%s[*] Descubriendo dispositivos activos (Sweep ARP ultrarrápido)...%s\n", Yellow, Reset)
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 100) 
-
+	
+	jobs := make(chan string, len(ips))
 	for _, ip := range ips {
+		jobs <- ip
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	// IMPORTANTE: En iSH/emuladores x86, usar un Pool de Workers (ej. 20)
+	// previene el error "runtime: split stack overflow" limitando el n. de goroutines simultáneas.
+	numWorkers := 20 
+
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(target string) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			
-			// Dial a puerto 80 (Web)
-			conn1, _ := net.DialTimeout("tcp", target+":80", 300*time.Millisecond)
-			if conn1 != nil { conn1.Close() }
-			
-			// Dial a puerto 445 (SMB, común en Windows firewalleados)
-			conn2, _ := net.DialTimeout("tcp", target+":445", 300*time.Millisecond)
-			if conn2 != nil { conn2.Close() }
-			
-			<-sem
-		}(ip)
+			for target := range jobs {
+				// Dial a puerto 80 (Web)
+				conn1, _ := net.DialTimeout("tcp", target+":80", 300*time.Millisecond)
+				if conn1 != nil { conn1.Close() }
+				
+				// Dial a puerto 445 (SMB, común en Windows firewalleados)
+				conn2, _ := net.DialTimeout("tcp", target+":445", 300*time.Millisecond)
+				if conn2 != nil { conn2.Close() }
+			}
+		}()
 	}
 	wg.Wait()
 }
@@ -275,23 +282,30 @@ func gatherOSGuess(activeIPs []string) map[string]string {
 	fmt.Printf("%s[*] Analizando firmas de red (OS Fingerprinting)...%s\n", Dim, Reset)
 	results := make(map[string]string)
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 20) 
 
+	jobs := make(chan string, len(activeIPs))
 	for _, ip := range activeIPs {
+		jobs <- ip
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	numWorkers := 10 // Worker Pool
+
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func(target string) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			ttl := getPingTTL(target)
-			osGuess := guessOSFromTTL(ttl)
-			if osGuess != "" {
-				mu.Lock()
-				results[target] = osGuess
-				mu.Unlock()
+			for target := range jobs {
+				ttl := getPingTTL(target)
+				osGuess := guessOSFromTTL(ttl)
+				if osGuess != "" {
+					mu.Lock()
+					results[target] = osGuess
+					mu.Unlock()
+				}
 			}
-			<-sem
-		}(ip)
+		}()
 	}
 	wg.Wait()
 	return results
@@ -370,46 +384,58 @@ func grabBanner(ip string, port int) string {
 	return ""
 }
 
+type scanJob struct {
+	IP   string
+	Port int
+}
+
 func portScan(activeIPs []string) map[string][]PortInfo {
 	fmt.Printf("%s[*] Escaneando puertos y extrayendo Banners/Títulos HTTP...%s\n", Blue, Reset)
 	results := make(map[string][]PortInfo)
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 60) // Evitar FDs exhaust limit
 
 	for _, ip := range activeIPs {
-		mu.Lock()
 		results[ip] = []PortInfo{}
-		mu.Unlock()
-		for _, port := range portsToScan {
-			wg.Add(1)
-			go func(targetIP string, targetPort int) {
-				defer wg.Done()
-				sem <- struct{}{}
+	}
 
-				target := fmt.Sprintf("%s:%d", targetIP, targetPort)
+	jobs := make(chan scanJob, len(activeIPs)*len(portsToScan))
+	for _, ip := range activeIPs {
+		for _, port := range portsToScan {
+			jobs <- scanJob{IP: ip, Port: port}
+		}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	numWorkers := 20 // Worker pool para evitar demasiadas conexiones simultáneas
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				target := fmt.Sprintf("%s:%d", job.IP, job.Port)
 				conn, err := net.DialTimeout("tcp", target, 500*time.Millisecond)
 				if err == nil {
 					conn.Close()
 					
 					// Puerto abierto, extraer banner
-					banner := grabBanner(targetIP, targetPort)
-					svc := portServices[targetPort]
+					banner := grabBanner(job.IP, job.Port)
+					svc := portServices[job.Port]
 					if svc == "" {
 						svc = "desconocido"
 					}
 
 					mu.Lock()
-					results[targetIP] = append(results[targetIP], PortInfo{
-						Port:    targetPort,
+					results[job.IP] = append(results[job.IP], PortInfo{
+						Port:    job.Port,
 						Service: svc,
 						Banner:  banner,
 					})
 					mu.Unlock()
 				}
-				<-sem
-			}(ip, port)
-		}
+			}
+		}()
 	}
 	wg.Wait()
 
@@ -533,7 +559,7 @@ func main() {
 		allIPs = append(allIPs, getIPsFromCIDR(sub)...)
 	}
 
-	// 1. ARP Sweep Mejorado
+	// 1. ARP Sweep (Con Worker Pool para evitar Split Stack Overflow en iSH)
 	arpSweepDial(allIPs)
 
 	// 2. Extracción de Caché ARP
