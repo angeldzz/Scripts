@@ -2,8 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,7 +31,7 @@ const (
 	Cyan    = "\033[96m"
 )
 
-// --- Base de datos local de Fabricantes ---
+// --- Base de datos local de Fabricantes (OUI) ---
 var commonMacVendors = map[string]string{
 	"00:1E:C2": "Apple", "00:1F:5B": "Apple", "18:AF:61": "Apple", "2C:F0:EE": "Apple", "F8:FF:C2": "Apple",
 	"00:24:D7": "Samsung", "00:15:99": "Samsung",
@@ -44,15 +45,34 @@ var commonMacVendors = map[string]string{
 	"00:1A:4B": "HP", "00:10:83": "HP", "00:1E:68": "Intel",
 }
 
-// --- Servicios comunes por puerto ---
+// --- Top Puertos a Escanear (Expandido) ---
+var portsToScan = []int{
+	21, 22, 23, 25, 53, 79, 80, 81, 88, 110, 111, 135, 139, 143, 389, 443, 445,
+	465, 515, 548, 554, 587, 631, 873, 993, 995, 1080, 1433, 1521, 1723, 2049,
+	2121, 3128, 3306, 3389, 3690, 3702, 4899, 5000, 5001, 5009, 5060, 5432,
+	5900, 5901, 6000, 62078, 6379, 6667, 7000, 8000, 8008, 8009, 8080, 8081,
+	8443, 8888, 9000, 9090, 9100, 9200, 10000, 11211, 27017,
+}
+
 var portServices = map[int]string{
 	21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
-	110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios-ssn", 143: "imap",
-	443: "https", 445: "microsoft-ds", 515: "printer", 548: "afp", 554: "rtsp",
-	631: "ipp", 993: "imaps", 995: "pop3s", 1723: "pptp", 3306: "mysql",
-	3389: "ms-wbt-server", 3702: "ws-discovery", 5000: "upnp/http", 5001: "iperf",
-	5900: "vnc", 62078: "apple-sync", 7000: "afs3-bos", 8000: "http-alt",
-	8008: "chromecast", 8009: "chromecast", 8080: "http-proxy", 8443: "https-alt", 9100: "jetdirect",
+	81: "http-alt", 88: "kerberos", 110: "pop3", 111: "rpcbind", 135: "msrpc",
+	139: "netbios-ssn", 143: "imap", 389: "ldap", 443: "https", 445: "microsoft-ds",
+	465: "smtps", 515: "printer", 548: "afp", 554: "rtsp", 587: "submission",
+	631: "ipp", 873: "rsync", 993: "imaps", 995: "pop3s", 1080: "socks",
+	1433: "ms-sql", 1521: "oracle", 1723: "pptp", 2049: "nfs", 3128: "squid",
+	3306: "mysql", 3389: "rdp", 3702: "ws-discovery", 5000: "upnp/http",
+	5001: "iperf", 5432: "postgresql", 5900: "vnc", 62078: "apple-sync",
+	6379: "redis", 7000: "afs3", 8000: "http-alt", 8008: "chromecast",
+	8009: "chromecast", 8080: "http-proxy", 8443: "https-alt", 8888: "http-alt",
+	9000: "cslistener", 9100: "jetdirect", 9200: "elasticsearch", 10000: "webmin",
+	27017: "mongodb",
+}
+
+type PortInfo struct {
+	Port    int
+	Service string
+	Banner  string
 }
 
 type HostInfo struct {
@@ -60,13 +80,14 @@ type HostInfo struct {
 	MAC      string
 	Vendor   string
 	Hostname string
-	Ports    []int
+	Ports    []PortInfo
+	OSGuess  string
 }
 
 func printBanner() {
 	banner := fmt.Sprintf(`
 %s%s╔═══════════════════════════════════════════════════════════════╗
-║ 🚀 DETECTIVE DE RED - ESCÁNER ULTRARRÁPIDO NATIVO EN GO       ║
+║ 🚀 DETECTIVE DE RED - ESCÁNER ULTIMATE NATIVO EN GO           ║
 ╚═══════════════════════════════════════════════════════════════╝%s`, Cyan, Bold, Reset)
 	fmt.Println(banner)
 }
@@ -84,7 +105,6 @@ func getLocalIP() string {
 func getLocalSubnets() []string {
 	subnets := make(map[string]bool)
 
-	// Método 1: Interfaces de red nativas de Go
 	ifaces, err := net.Interfaces()
 	if err == nil {
 		for _, i := range ifaces {
@@ -105,7 +125,6 @@ func getLocalSubnets() []string {
 		}
 	}
 
-	// Método 2: Fallback utilizando comandos del sistema (útil en iSH)
 	out, err := exec.Command("ip", "-4", "route").Output()
 	if err == nil {
 		lines := strings.Split(string(out), "\n")
@@ -124,7 +143,6 @@ func getLocalSubnets() []string {
 		result = append(result, k)
 	}
 
-	// Fallback final si no se detecta nada
 	if len(result) == 0 {
 		ip := getLocalIP()
 		if ip != "" {
@@ -148,7 +166,7 @@ func getIPsFromCIDR(cidr string) []string {
 		ips = append(ips, ip.String())
 	}
 	if len(ips) > 2 {
-		return ips[1 : len(ips)-1] // Excluir red y broadcast
+		return ips[1 : len(ips)-1]
 	}
 	return ips
 }
@@ -162,23 +180,25 @@ func inc(ip net.IP) {
 	}
 }
 
-// arpSweepDial envía una petición TCP rápida al puerto 80.
-// Esto obliga al kernel a resolver la IP por ARP, poblando la tabla
-// sin necesidad de hacer forks para ejecutar comandos ping (mucho más ligero en iSH).
 func arpSweepDial(ips []string) {
 	fmt.Printf("%s[*] Descubriendo dispositivos activos (Sweep ARP ultrarrápido)...%s\n", Yellow, Reset)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 100) // Máx 100 goroutines para no agotar FDs en iSH
+	sem := make(chan struct{}, 100) 
 
 	for _, ip := range ips {
 		wg.Add(1)
 		go func(target string) {
 			defer wg.Done()
 			sem <- struct{}{}
-			conn, _ := net.DialTimeout("tcp", target+":80", 400*time.Millisecond)
-			if conn != nil {
-				conn.Close()
-			}
+			
+			// Dial a puerto 80 (Web)
+			conn1, _ := net.DialTimeout("tcp", target+":80", 300*time.Millisecond)
+			if conn1 != nil { conn1.Close() }
+			
+			// Dial a puerto 445 (SMB, común en Windows firewalleados)
+			conn2, _ := net.DialTimeout("tcp", target+":445", 300*time.Millisecond)
+			if conn2 != nil { conn2.Close() }
+			
 			<-sem
 		}(ip)
 	}
@@ -224,22 +244,142 @@ func getARPCache() map[string]string {
 	return arpTable
 }
 
-func portScan(activeIPs []string) map[string][]int {
-	fmt.Printf("%s[*] Escaneando puertos concurrentemente (sin dependencias externas)...%s\n", Blue, Reset)
-	results := make(map[string][]int)
+// OS Fingerprinting usando TTL de ping
+func getPingTTL(ip string) int {
+	out, err := exec.Command("ping", "-c", "1", "-W", "1", ip).Output()
+	if err != nil {
+		return 0
+	}
+	ttlRegex := regexp.MustCompile(`(?i)ttl=(\d+)`)
+	matches := ttlRegex.FindStringSubmatch(string(out))
+	if len(matches) > 1 {
+		ttl, _ := strconv.Atoi(matches[1])
+		return ttl
+	}
+	return 0
+}
+
+func guessOSFromTTL(ttl int) string {
+	if ttl == 0 { return "" }
+	if ttl > 0 && ttl <= 64 {
+		return "Linux / Unix / macOS"
+	} else if ttl > 64 && ttl <= 128 {
+		return "Windows"
+	} else if ttl > 128 && ttl <= 255 {
+		return "Cisco / Network Gear"
+	}
+	return ""
+}
+
+func gatherOSGuess(activeIPs []string) map[string]string {
+	fmt.Printf("%s[*] Analizando firmas de red (OS Fingerprinting)...%s\n", Dim, Reset)
+	results := make(map[string]string)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 80)
+	sem := make(chan struct{}, 20) 
 
-	portsToScan := []int{
-		21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 515, 548,
-		554, 631, 993, 995, 1723, 3306, 3389, 3702, 5000, 5001, 5900, 62078,
-		7000, 8000, 8008, 8009, 8080, 8443, 9100,
+	for _, ip := range activeIPs {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			ttl := getPingTTL(target)
+			osGuess := guessOSFromTTL(ttl)
+			if osGuess != "" {
+				mu.Lock()
+				results[target] = osGuess
+				mu.Unlock()
+			}
+			<-sem
+		}(ip)
 	}
+	wg.Wait()
+	return results
+}
+
+// Banner Grabbing: Lee versiones de servicios y <titles> HTTP
+func grabBanner(ip string, port int) string {
+	target := fmt.Sprintf("%s:%d", ip, port)
+	
+	// HTTP/HTTPS Specific Extraction
+	if port == 80 || port == 8080 || port == 8000 || port == 81 || port == 8888 || port == 443 || port == 8443 {
+		scheme := "http"
+		if port == 443 || port == 8443 {
+			scheme = "https"
+		}
+		
+		client := &http.Client{
+			Timeout: 1500 * time.Millisecond,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		
+		req, _ := http.NewRequest("GET", fmt.Sprintf("%s://%s/", scheme, target), nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		resp, err := client.Do(req)
+		
+		if err == nil {
+			defer resp.Body.Close()
+			server := resp.Header.Get("Server")
+			
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			bodyStr := string(body)
+			
+			title := ""
+			titleRegex := regexp.MustCompile(`(?i)<title>(.*?)</title>`)
+			matches := titleRegex.FindStringSubmatch(bodyStr)
+			if len(matches) > 1 {
+				title = strings.TrimSpace(matches[1])
+			}
+			
+			var details []string
+			if server != "" { details = append(details, server) }
+			if title != "" { details = append(details, `"`+title+`"`) }
+			
+			if len(details) > 0 {
+				return strings.Join(details, " | ")
+			}
+			return fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+	}
+	
+	// Generic TCP Banner Grab
+	conn, err := net.DialTimeout("tcp", target, 800*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err == nil && n > 0 {
+		banner := string(buf[:n])
+		banner = strings.ReplaceAll(banner, "\r", "")
+		banner = strings.ReplaceAll(banner, "\n", " ")
+		banner = strings.TrimSpace(banner)
+		
+		if len(banner) > 60 {
+			banner = banner[:57] + "..."
+		}
+		return banner
+	}
+	
+	return ""
+}
+
+func portScan(activeIPs []string) map[string][]PortInfo {
+	fmt.Printf("%s[*] Escaneando puertos y extrayendo Banners/Títulos HTTP...%s\n", Blue, Reset)
+	results := make(map[string][]PortInfo)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 60) // Evitar FDs exhaust limit
 
 	for _, ip := range activeIPs {
 		mu.Lock()
-		results[ip] = []int{}
+		results[ip] = []PortInfo{}
 		mu.Unlock()
 		for _, port := range portsToScan {
 			wg.Add(1)
@@ -251,8 +391,20 @@ func portScan(activeIPs []string) map[string][]int {
 				conn, err := net.DialTimeout("tcp", target, 500*time.Millisecond)
 				if err == nil {
 					conn.Close()
+					
+					// Puerto abierto, extraer banner
+					banner := grabBanner(targetIP, targetPort)
+					svc := portServices[targetPort]
+					if svc == "" {
+						svc = "desconocido"
+					}
+
 					mu.Lock()
-					results[targetIP] = append(results[targetIP], targetPort)
+					results[targetIP] = append(results[targetIP], PortInfo{
+						Port:    targetPort,
+						Service: svc,
+						Banner:  banner,
+					})
 					mu.Unlock()
 				}
 				<-sem
@@ -262,7 +414,9 @@ func portScan(activeIPs []string) map[string][]int {
 	wg.Wait()
 
 	for k := range results {
-		sort.Ints(results[k])
+		sort.Slice(results[k], func(i, j int) bool {
+			return results[k][i].Port < results[k][j].Port
+		})
 	}
 	return results
 }
@@ -276,7 +430,7 @@ func fetchVendor(mac string) string {
 	if err == nil {
 		defer resp.Body.Close()
 		if resp.StatusCode == 200 {
-			body, _ := ioutil.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			return strings.TrimSpace(string(body))
 		}
 	}
@@ -296,8 +450,22 @@ func getDeviceType(info *HostInfo) string {
 	vendorLower := strings.ToLower(info.Vendor)
 
 	portSet := make(map[int]bool)
+	var bannersStr string
 	for _, p := range info.Ports {
-		portSet[p] = true
+		portSet[p.Port] = true
+		bannersStr += strings.ToLower(p.Banner) + " "
+	}
+
+	// Heurísticas avanzadas usando Banners
+	if strings.Contains(bannersStr, "synology") || strings.Contains(hostname, "diskstation") { return "🗄️ NAS Synology" }
+	if strings.Contains(bannersStr, "qnap") { return "🗄️ NAS QNAP" }
+	if strings.Contains(bannersStr, "ubuntu") { return "🐧 Servidor Ubuntu" }
+	if strings.Contains(bannersStr, "debian") { return "🐧 Servidor Debian" }
+	if strings.Contains(bannersStr, "raspbian") { return "🍓 Raspberry Pi" }
+	if strings.Contains(bannersStr, "routeros") || strings.Contains(bannersStr, "mikrotik") { return "🌐 Router MikroTik" }
+	if strings.Contains(bannersStr, "openwrt") { return "🌐 Router OpenWrt" }
+	if strings.Contains(bannersStr, "apache") || strings.Contains(bannersStr, "nginx") || strings.Contains(bannersStr, "lighttpd") { 
+		if portSet[53] || portSet[80] { return "🌐 Router / Servidor Web" }
 	}
 
 	if strings.Contains(hostname, "iphone") || strings.Contains(hostname, "ipad") { return "📱 iPhone / iPad (iOS)" }
@@ -324,7 +492,10 @@ func getDeviceType(info *HostInfo) string {
 	if strings.Contains(vendorLower, "samsung") || strings.Contains(vendorLower, "lg") || strings.Contains(vendorLower, "sony") || strings.Contains(vendorLower, "nintendo") { return "📺 Smart TV / Consola / Multimedia" }
 	if strings.Contains(vendorLower, "xiaomi") || strings.Contains(vendorLower, "huawei") || strings.Contains(vendorLower, "motorola") { return "📱 Smartphone Android" }
 
-	if len(info.Ports) == 0 { return "👻 Dispositivo Oculto (Solo responde a ARP)" }
+	if info.OSGuess == "Windows" && (portSet[139] || portSet[445]) { return "🪟 PC Windows" }
+	if info.OSGuess == "Linux / Unix / macOS" && portSet[22] { return "🐧 Servidor Linux / Unix" }
+
+	if len(info.Ports) == 0 { return "👻 Dispositivo Oculto (Solo responde a ARP/Ping)" }
 	return "🖥️ Dispositivo Desconocido"
 }
 
@@ -362,10 +533,10 @@ func main() {
 		allIPs = append(allIPs, getIPsFromCIDR(sub)...)
 	}
 
-	// 1. ARP Dial Sweep
+	// 1. ARP Sweep Mejorado
 	arpSweepDial(allIPs)
 
-	// 2. Extraer Caché ARP
+	// 2. Extracción de Caché ARP
 	arpTable := getARPCache()
 	localIP := getLocalIP()
 	if localIP != "" {
@@ -384,12 +555,25 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 3. Escaneo de Puertos a IPs Activas
-	openPorts := portScan(activeIPs)
+	// 3. OS Fingerprinting y Port Scanning (Concurrentes)
+	var wg sync.WaitGroup
+	var osGuesses map[string]string
+	var openPorts map[string][]PortInfo
 
-	fmt.Printf("%s🔍 Analizando %d hosts y consultando OUI...%s\n\n", Dim, len(activeIPs), Reset)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		osGuesses = gatherOSGuess(activeIPs)
+	}()
+	go func() {
+		defer wg.Done()
+		openPorts = portScan(activeIPs)
+	}()
+	wg.Wait()
 
-	// 4. Procesar y Mostrar Resultados
+	fmt.Printf("\n%s🔍 Cruzando datos heurísticos (MAC OUI, Banners, OS, Puertos)...%s\n\n", Dim, Reset)
+
+	// 4. Mostrar Resultados
 	vendorCache := make(map[string]string)
 	sortIPs(activeIPs)
 
@@ -410,7 +594,7 @@ func main() {
 				vendor = fetchVendor(mac)
 				vendorCache[mac] = vendor
 				if vendor != "Desconocido" {
-					time.Sleep(1 * time.Second) // Evitar ban de API
+					time.Sleep(1 * time.Second) // Prevención de rate-limit
 				}
 			}
 		} else if mac == "Dispositivo Local" {
@@ -424,6 +608,7 @@ func main() {
 			Vendor:   vendor,
 			Hostname: hostname,
 			Ports:    openPorts[ip],
+			OSGuess:  osGuesses[ip],
 		}
 
 		deviceType := getDeviceType(info)
@@ -435,10 +620,14 @@ func main() {
 		if vendor != "Desconocido" {
 			vendorStr = fmt.Sprintf(" [%s]", vendor)
 		}
+		osStr := ""
+		if info.OSGuess != "" {
+			osStr = fmt.Sprintf(" %s| OS: %s%s", Dim, info.OSGuess, Reset)
+		}
 
 		fmt.Printf("%s📍 %s%s%s%s%s\n", Cyan, Bold, info.IP, Reset, Yellow, hostStr, Reset)
 		fmt.Printf("    %s├─ MAC:%s %s%s%s%s\n", Dim, Reset, info.MAC, Magenta, vendorStr, Reset)
-		fmt.Printf("    %s├─ Tipo:%s %s%s%s\n", Dim, Reset, Bold, deviceType, Reset)
+		fmt.Printf("    %s├─ Tipo:%s %s%s%s%s\n", Dim, Reset, Bold, deviceType, Reset, osStr)
 
 		if len(info.Ports) > 0 {
 			fmt.Printf("    %s└─ Puertos Abiertos (%d):%s\n", Green, len(info.Ports), Reset)
@@ -447,11 +636,13 @@ func main() {
 				if i == len(info.Ports)-1 {
 					branch = "   └─"
 				}
-				svc := "desconocido"
-				if s, ok := portServices[p]; ok {
-					svc = s
+				
+				bannerStr := ""
+				if p.Banner != "" {
+					bannerStr = fmt.Sprintf("%s ➜ %s%s", Dim, p.Banner, Reset)
 				}
-				fmt.Printf("    %s%s%s [%d/tcp] %s%s%s\n", Dim, branch, Reset, p, Bold, svc, Reset)
+				
+				fmt.Printf("    %s%s%s [%d/tcp] %s%s%s%s\n", Dim, branch, Reset, p.Port, Bold, p.Service, Reset, bannerStr)
 			}
 		} else {
 			fmt.Printf("    %s└─ 🔴 0 puertos abiertos (Firewall cerrado/activo).%s\n", Dim, Reset)
@@ -460,5 +651,5 @@ func main() {
 	}
 
 	elapsed := time.Since(startTime)
-	fmt.Printf("%s%s✅ Auditoría finalizada en %.1f segundos.%s\n", Green, Bold, elapsed.Seconds(), Reset)
+	fmt.Printf("%s%s✅ Escaneo Ultimate finalizado en %.1f segundos.%s\n", Green, Bold, elapsed.Seconds(), Reset)
 }
