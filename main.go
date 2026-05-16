@@ -291,7 +291,7 @@ func gatherOSGuess(activeIPs []string) map[string]string {
 	close(jobs)
 
 	var wg sync.WaitGroup
-	numWorkers := 10 // Worker Pool
+	numWorkers := 30 // Worker Pool
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -408,7 +408,7 @@ func portScan(activeIPs []string) map[string][]PortInfo {
 	close(jobs)
 
 	var wg sync.WaitGroup
-	numWorkers := 20 // Worker pool para evitar demasiadas conexiones simultáneas
+	numWorkers := 80 // 80 acelera el escaneo ciego sin saturar los FDs en iSH
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -584,9 +584,11 @@ func main() {
 		activeIPs = append(activeIPs, ip)
 	}
 
-	if len(activeIPs) == 0 {
-		fmt.Printf("%s[!] No se encontraron dispositivos activos en la red.%s\n", Yellow, Reset)
-		os.Exit(0)
+	if len(activeIPs) <= 1 {
+		fmt.Printf("%s[!] Caché ARP inaccesible en iSH. Cambiando a Escaneo Ciego Profundo (Tomará ~1-2 min)...%s\n", Yellow, Reset)
+		activeIPs = allIPs
+	} else {
+		fmt.Printf("%s[*] Se descubrieron %d dispositivos mediante Caché ARP.%s\n", Green, len(activeIPs), Reset)
 	}
 
 	// 3. OS Fingerprinting y Port Scanning (Concurrentes)
@@ -654,6 +656,11 @@ func main() {
 		if vendor != "Desconocido" {
 			vendorStr = fmt.Sprintf(" [%s]", vendor)
 		}
+		// Si el host no responde absolutamente a nada (completamente muerto/filtrado), lo ocultamos
+		if len(info.Ports) == 0 && (info.MAC == "Desconocida" || info.MAC == "") && info.OSGuess == "" && vendor == "Desconocido" && vendor != "Este Equipo" {
+			continue
+		}
+
 		osStr := ""
 		if info.OSGuess != "" {
 			osStr = fmt.Sprintf(" %s| OS: %s%s", Dim, info.OSGuess, Reset)

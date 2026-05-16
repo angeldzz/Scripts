@@ -328,7 +328,8 @@ def main():
         arp_data = populate_arp_and_get_ips(subnet)
         all_targets.update(arp_data)
         
-    if not all_targets:
+    if len(all_targets) <= 1:
+        print(f"\n{C.YELLOW}[!] Caché ARP inaccesible en iSH. Cambiando a Escaneo Ciego Profundo de toda la subred...{C.RESET}")
         targets = subnets
     else:
         targets = list(all_targets.keys())
@@ -363,6 +364,10 @@ def main():
         return
         
     for ip, info in sorted(hosts_info.items(), key=lambda x: tuple(map(int, x[0].split('.')))):
+        # Ocultar hosts muertos o inaccesibles cuando se escanea la subred completa
+        if not info['ports'] and info.get('mac', 'Desconocida') == 'Desconocida':
+            continue
+
         hostname_str = f" ({info['hostname']})" if info['hostname'] else ""
         device_type = get_device_type(info, info['vendor'])
         mac_str = info['mac']
